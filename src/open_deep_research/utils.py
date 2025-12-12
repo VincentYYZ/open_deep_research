@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from pathlib import Path
 import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
@@ -32,6 +33,42 @@ from tavily import AsyncTavilyClient
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
 from open_deep_research.state import ResearchComplete, Summary
+
+
+def _load_env_file():
+    """Load environment variables from a local .env if they are not already set."""
+    # Avoid re-loading if we've already processed a .env file
+    if os.getenv("_OPEN_DEEP_RESEARCH_ENV_LOADED") == "1":
+        return
+
+    candidate_paths = [
+        Path(".env"),
+        Path(__file__).resolve().parents[2] / ".env",  # repo root when imported from src/
+    ]
+
+    for env_path in candidate_paths:
+        if not env_path.exists():
+            continue
+        try:
+            for line in env_path.read_text().splitlines():
+                # Skip comments/blank lines
+                if not line or line.strip().startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                # Do not override explicitly-set environment variables
+                if key and os.getenv(key) is None:
+                    os.environ[key] = value
+            os.environ["_OPEN_DEEP_RESEARCH_ENV_LOADED"] = "1"
+            break
+        except Exception:
+            # Fail quietly; downstream code will still attempt to read explicit env/config
+            continue
+
+
+# Load .env values early so model and tool configuration can find local endpoints/keys.
+_load_env_file()
 
 ##########################
 # Tavily Search Tool Utils
@@ -906,7 +943,12 @@ def get_api_key_for_model(model_name: str, config: RunnableConfig):
         return None
     else:
         if model_name.startswith("openai:"): 
-            return os.getenv("OPENAI_API_KEY")
+            # Prefer explicit env; if missing but a local OpenAI-compatible endpoint is set,
+            # return a dummy key to satisfy client validation.
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key and os.getenv("OPENAI_BASE_URL"):
+                return "dummy"
+            return api_key
         elif model_name.startswith("anthropic:"):
             return os.getenv("ANTHROPIC_API_KEY")
         elif model_name.startswith("google"):

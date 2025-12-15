@@ -3,6 +3,7 @@
 This demo shows:
 - LangGraph core graph/state APIs: StateGraph, MessagesState, Command, START/END
 - LangGraph persistence APIs: compile(checkpointer=...), get_state/aget_state, thread_id
+- LangGraph streaming APIs: astream(stream_mode="values") for step-by-step progress
 - Using a local OpenAI-compatible model (e.g. vLLM) via OPENAI_BASE_URL
 """
 
@@ -156,12 +157,14 @@ async def main() -> None:
         if snapshot is not None and snapshot.interrupts:
             pending = snapshot.interrupts[0]
             resume_val = input(f"检测到上次执行暂停：{pending.value} ")
-            result = await simple_graph.ainvoke(
+            async for chunk in simple_graph.astream(
                 Command(resume=resume_val),
                 config=config,
+                stream_mode="values",
                 durability="sync",
-            )
-            messages = result.get("messages", messages)
+            ):
+                if "messages" in chunk:
+                    messages = chunk["messages"]
 
         while True:
             user_input = input("你想问什么？(输入 exit 退出) ")
@@ -169,25 +172,34 @@ async def main() -> None:
                 break
 
             messages.append(HumanMessage(content=user_input))
-            result = await simple_graph.ainvoke(
+
+            # LangGraph streaming:
+            # - astream(..., stream_mode="values") 会按“步骤”产出当前 state 的快照
+            # - 我们一边读流，一边更新 messages（对话历史）
+            # - 如果遇到 interrupt，就提示你输入并用 Command(resume=...) 继续跑
+            pending_interrupts = None
+            async for chunk in simple_graph.astream(
                 {"messages": messages},
                 config=config,
+                stream_mode="values",
                 durability="sync",
-            )
+            ):
+                if "messages" in chunk:
+                    messages = chunk["messages"]
+                if "__interrupt__" in chunk:
+                    pending_interrupts = chunk["__interrupt__"]
 
-            # 如果执行到 confirm 节点触发了 interrupt，就在这里读取用户输入并恢复执行
-            if "__interrupt__" in result:
-                interrupts = result.get("__interrupt__") or []
-                prompt = interrupts[0].value if interrupts else "请输入："
+            if pending_interrupts:
+                prompt = pending_interrupts[0].value if pending_interrupts else "请输入："
                 resume_val = input(f"{prompt} ")
-                messages = result.get("messages", messages)
-                result = await simple_graph.ainvoke(
+                async for chunk in simple_graph.astream(
                     Command(resume=resume_val),
                     config=config,
+                    stream_mode="values",
                     durability="sync",
-                )
-
-            messages = result["messages"]
+                ):
+                    if "messages" in chunk:
+                        messages = chunk["messages"]
 
             # 打印本轮最新的 AI 回复
             for msg in reversed(messages):

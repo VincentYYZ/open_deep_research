@@ -17,7 +17,7 @@ from langchain_core.runnables import RunnableConfig
 
 # LangGraph: 核心图与状态模块
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 # LangGraph persistence: 使用异步 SQLite 检查点后端
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -35,7 +35,7 @@ def _load_env_from_repo_root() -> None:
         key = key.strip()
         value = value.strip()
         if key and os.getenv(key) is None:
-            os.environ[key] = value
+            os.environ[key] = value 
 
 
 _load_env_from_repo_root()
@@ -57,14 +57,32 @@ CHECKPOINT_PATH = Path(__file__).resolve().parents[1] / "simple_agent_checkpoint
 
 async def router(
     state: SimpleState, config: RunnableConfig
-) -> Command[Literal["answer", "__end__"]]:
-    """Route to the answer node if there is a user question."""
+) -> Command[Literal["confirm", "__end__"]]:
+    """Route to the confirm node if there is a user question."""
     last = state["messages"][-1] if state["messages"] else None
     if isinstance(last, HumanMessage) and str(last.content).strip():
-        return Command(goto="answer")
+        return Command(goto="confirm")
     return Command(
         goto=END,
         update={"messages": [AIMessage(content="请输入一个问题再运行。")]},
+    )
+
+
+async def confirm(
+    state: SimpleState, config: RunnableConfig
+) -> Command[Literal["answer", "__end__"]]:
+    """Durable execution 小例子：在这里“停下来”等你输入。
+
+    interrupt(...) 会让图执行到这里时暂停，并把暂停点和当前状态
+    存到 SQLite 检查点里。之后我们可以用 Command(resume=...)
+    从这个节点继续执行。
+    """
+    decision = interrupt("要现在回答吗？输入 yes/no")
+    if str(decision).strip().lower() in {"y", "yes"}:
+        return Command(goto="answer")
+    return Command(
+        goto=END,
+        update={"messages": [AIMessage(content="好的，那我先不回答。")]},
     )
 
 
@@ -100,11 +118,16 @@ async def answer(state: SimpleState, config: RunnableConfig):
     return {"messages": [response]}
 
 
-# LangGraph: 构建最简单的图（router -> answer）
+# LangGraph: 构建简单的图（router -> confirm -> answer）
 builder = StateGraph(SimpleState)
 builder.add_node("router", router)
+builder.add_node("confirm", confirm)
 builder.add_node("answer", answer)
 builder.add_edge(START, "router")
+builder.add_edge("router", "confirm")
+builder.add_edge("router", END)
+builder.add_edge("confirm", "answer")
+builder.add_edge("confirm", END)
 builder.add_edge("answer", END)
 
 
@@ -127,6 +150,19 @@ async def main() -> None:
             if isinstance(existing, list):
                 messages = existing
 
+        # Durable execution 的关键效果之一：
+        # 如果上次运行在 confirm 节点 interrupt 处中断了（比如你关掉程序），
+        # 这里会检测到未完成的 interrupt，并让你输入后继续执行。
+        if snapshot is not None and snapshot.interrupts:
+            pending = snapshot.interrupts[0]
+            resume_val = input(f"检测到上次执行暂停：{pending.value} ")
+            result = await simple_graph.ainvoke(
+                Command(resume=resume_val),
+                config=config,
+                durability="sync",
+            )
+            messages = result.get("messages", messages)
+
         while True:
             user_input = input("你想问什么？(输入 exit 退出) ")
             if not user_input.strip() or user_input.strip().lower() == "exit":
@@ -136,7 +172,21 @@ async def main() -> None:
             result = await simple_graph.ainvoke(
                 {"messages": messages},
                 config=config,
+                durability="sync",
             )
+
+            # 如果执行到 confirm 节点触发了 interrupt，就在这里读取用户输入并恢复执行
+            if "__interrupt__" in result:
+                interrupts = result.get("__interrupt__") or []
+                prompt = interrupts[0].value if interrupts else "请输入："
+                resume_val = input(f"{prompt} ")
+                messages = result.get("messages", messages)
+                result = await simple_graph.ainvoke(
+                    Command(resume=resume_val),
+                    config=config,
+                    durability="sync",
+                )
+
             messages = result["messages"]
 
             # 打印本轮最新的 AI 回复
@@ -148,4 +198,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

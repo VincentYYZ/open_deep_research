@@ -4,6 +4,7 @@ This demo shows:
 - LangGraph core graph/state APIs: StateGraph, MessagesState, Command, START/END
 - LangGraph persistence APIs: compile(checkpointer=...), get_state/aget_state, thread_id
 - LangGraph streaming APIs: astream(stream_mode="values") for step-by-step progress
+- Graph-level interrupts: interrupt_after=["confirm"] to pause durably between steps
 - Using a local OpenAI-compatible model (e.g. vLLM) via OPENAI_BASE_URL
 """
 
@@ -18,7 +19,7 @@ from langchain_core.runnables import RunnableConfig
 
 # LangGraph: 核心图与状态模块
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command
 
 # LangGraph persistence: 使用异步 SQLite 检查点后端
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -69,22 +70,15 @@ async def router(
     )
 
 
-async def confirm(
-    state: SimpleState, config: RunnableConfig
-) -> Command[Literal["answer", "__end__"]]:
-    """Durable execution 小例子：在这里“停下来”等你输入。
+def confirm(state: SimpleState, config: RunnableConfig):
+    """Checkpoint boundary node (doesn't change state).
 
-    interrupt(...) 会让图执行到这里时暂停，并把暂停点和当前状态
-    存到 SQLite 检查点里。之后我们可以用 Command(resume=...)
-    从这个节点继续执行。
+    We pause execution AFTER this node by running the graph with:
+    interrupt_after=["confirm"]
+
+    This demonstrates durable pause/resume using the SQLite checkpointer.
     """
-    decision = interrupt("要现在回答吗？输入 yes/no")
-    if str(decision).strip().lower() in {"y", "yes"}:
-        return Command(goto="answer")
-    return Command(
-        goto=END,
-        update={"messages": [AIMessage(content="好的，那我先不回答。")]},
-    )
+    return {}
 
 
 async def answer(state: SimpleState, config: RunnableConfig):
@@ -126,9 +120,7 @@ builder.add_node("confirm", confirm)
 builder.add_node("answer", answer)
 builder.add_edge(START, "router")
 builder.add_edge("router", "confirm")
-builder.add_edge("router", END)
 builder.add_edge("confirm", "answer")
-builder.add_edge("confirm", END)
 builder.add_edge("answer", END)
 
 
@@ -151,20 +143,33 @@ async def main() -> None:
             if isinstance(existing, list):
                 messages = existing
 
-        # Durable execution 的关键效果之一：
-        # 如果上次运行在 confirm 节点 interrupt 处中断了（比如你关掉程序），
-        # 这里会检测到未完成的 interrupt，并让你输入后继续执行。
-        if snapshot is not None and snapshot.interrupts:
-            pending = snapshot.interrupts[0]
-            resume_val = input(f"检测到上次执行暂停：{pending.value} ")
-            async for chunk in simple_graph.astream(
-                Command(resume=resume_val),
-                config=config,
-                stream_mode="values",
-                durability="sync",
-            ):
-                if "messages" in chunk:
-                    messages = chunk["messages"]
+        # Durable execution（图级别暂停点）：
+        # 我们每次都把图跑到 confirm 之后就暂停（interrupt_after=["confirm"]），
+        # 所以如果你上次运行在 confirm 后退出了，这里会看到 next 里还有 "answer"。
+        if snapshot is not None and snapshot.next and "answer" in snapshot.next:
+            decision = input("检测到上次停在确认步骤：要继续回答吗？输入 yes/no ")
+            if str(decision).strip().lower() in {"y", "yes"}:
+                async for chunk in simple_graph.astream(
+                    None,
+                    config=config,
+                    stream_mode="values",
+                    durability="sync",
+                    interrupt_after=["confirm"],
+                ):
+                    if "messages" in chunk:
+                        messages = chunk["messages"]
+            else:
+                async for chunk in simple_graph.astream(
+                    Command(
+                        goto=END,
+                        update={"messages": [AIMessage(content="好的，那我先不回答。")]},
+                    ),
+                    config=config,
+                    stream_mode="values",
+                    durability="sync",
+                ):
+                    if "messages" in chunk:
+                        messages = chunk["messages"]
 
         while True:
             user_input = input("你想问什么？(输入 exit 退出) ")
@@ -176,24 +181,34 @@ async def main() -> None:
             # LangGraph streaming:
             # - astream(..., stream_mode="values") 会按“步骤”产出当前 state 的快照
             # - 我们一边读流，一边更新 messages（对话历史）
-            # - 如果遇到 interrupt，就提示你输入并用 Command(resume=...) 继续跑
-            pending_interrupts = None
+            # - interrupt_after=["confirm"]：在 confirm 节点之后暂停（并把 next="answer" 存到 SQLite）
             async for chunk in simple_graph.astream(
                 {"messages": messages},
                 config=config,
                 stream_mode="values",
                 durability="sync",
+                interrupt_after=["confirm"],
             ):
                 if "messages" in chunk:
                     messages = chunk["messages"]
-                if "__interrupt__" in chunk:
-                    pending_interrupts = chunk["__interrupt__"]
 
-            if pending_interrupts:
-                prompt = pending_interrupts[0].value if pending_interrupts else "请输入："
-                resume_val = input(f"{prompt} ")
+            decision = input("要现在回答吗？输入 yes/no ")
+            if str(decision).strip().lower() in {"y", "yes"}:
                 async for chunk in simple_graph.astream(
-                    Command(resume=resume_val),
+                    None,
+                    config=config,
+                    stream_mode="values",
+                    durability="sync",
+                    interrupt_after=["confirm"],
+                ):
+                    if "messages" in chunk:
+                        messages = chunk["messages"]
+            else:
+                async for chunk in simple_graph.astream(
+                    Command(
+                        goto=END,
+                        update={"messages": [AIMessage(content="好的，那我先不回答。")]},
+                    ),
                     config=config,
                     stream_mode="values",
                     durability="sync",
